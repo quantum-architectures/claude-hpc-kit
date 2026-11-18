@@ -1,0 +1,17 @@
+{
+  "name": "claude-hpc-kit",
+  "owner": { "name": "claude-hpc-kit maintainers" },
+  "description": "Let Claude Code run, watch and debug jobs on your own compute clusters",
+  "plugins": [
+    {
+      "name": "hpc",
+      "source": "./plugins/hpc",
+      "description": "Skills and a small CLI that let Claude copy code to your clusters, submit Slurm or PBS jobs, watch them and pull results back"
+    },
+    {
+      "name": "compute-pane",
+      "source": "./plugins/compute-pane",
+      "description": "A read-only pane that lists your Slurm and PBS jobs on the sites in the hpc site registry"
+    }
+  ]
+}

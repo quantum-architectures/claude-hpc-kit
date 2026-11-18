@@ -1,0 +1,24 @@
+# Add a block like this to ~/.ssh/config for each site.
+#
+# ControlMaster keeps one authenticated connection open. You log in once
+# (password and second factor), and every later ssh, rsync and hpc call reuses
+# the connection without a prompt. Claude never sees or stores your credentials.
+# Use ControlMaster for every site. Each hpc call and each poll of the compute
+# pane is an ssh connection, and a shared connection makes each one fast.
+
+Host mycluster
+    HostName login.cluster.example.edu
+    User your_username
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 12h
+    ServerAliveInterval 60
+
+# A machine with key login. ControlMaster here saves a new login on each call.
+Host gpubox
+    HostName 203.0.113.10
+    User ubuntu
+    IdentityFile ~/.ssh/id_ed25519
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 12h

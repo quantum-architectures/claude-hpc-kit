@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# hpc: run the current project on a compute site, and watch its jobs.
+# It works from any project directory and needs no per-project setup.
+#
+#   hpc sites            list the sites and whether each one is connected
+#   hpc push PATH...     copy files to the remote project (never deletes remote files)
+#   hpc down             copy the pull-back directories (default: results/) back
+#   hpc sync             run the project's sync command remotely (default: uv sync)
+#   hpc sh [CMD...]      run a command in the remote project directory
+#   hpc sbatch FILE...   submit a job script (Slurm: sbatch, PBS: qsub); FILE is relative to the project root
+#   hpc q                show your queue
+#   hpc jobs [N]         queue and the last N log lines of each running job (default 3).
+#                        On Slurm, also the jobs that failed in the last $HPC_FAIL_HOURS h (default 6).
+#   hpc log JOBID [N]    the last N lines (default 40) of a job's stdout and stderr
+#
+# Without SITE, `q` and `jobs` cover every connected scheduler site in one call.
+#
+# Pick a site with SITE=<name>. Without SITE, hpc uses $HPC_DEFAULT_SITE, else the
+# first site in the registry. The registry is ~/.config/hpc/sites.conf (or
+# $HPC_SITES_CONF). Add a site by adding a block there; see sites.conf.example.
+#
+# The remote project directory is <site base>/<project name>. The project name is
+# the basename of the local git root, or of the current directory.
+# push takes paths relative to the current directory, inside the project.
+#
+# `hpc sh` with one argument runs it as a shell command line, for example
+# hpc sh 'make && ./run'. With several arguments, each argument is one word.
+#
+# A project can override two defaults, in its .envrc (read with direnv) or in the shell:
+#   export HPC_SYNC_CMD="pip install -e ."    # default: uv sync
+#   export HPC_PULL_DIRS="data/processed/"    # added to results/
+#
+# hpc never mirrors with rsync --delete. push copies only the files you name.
+set -euo pipefail
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
+
+case "${1:-}" in
+  ""|-h|--help|help) usage; exit 0 ;;
+  sites|push|down|sync|sh|sbatch|q|jobs|log) ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+SITES_CONF="${HPC_SITES_CONF:-$HOME/.config/hpc/sites.conf}"
+[ -f "$SITES_CONF" ] || {
+  echo "hpc: no site registry at $SITES_CONF (ask Claude to run the hpc-setup skill)" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$SITES_CONF"
+
+# Sites in the order the registry defines them.
+all_sites() {
+  sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}site_\([A-Za-z0-9_]*\)_HOST=.*/\2/p' "$SITES_CONF" |
+    awk '!seen[$0]++'
+}
+field() { local v="site_${1}_$2"; echo "${!v:-}"; }
+
+if [ "$1" = sites ]; then
+  for s in $(all_sites); do
+    if eval "$(field "$s" AUTH_CHECK)" >/dev/null 2>&1; then st=connected; else st="not connected: $(field "$s" AUTH_HINT)"; fi
+    printf '%-14s %-6s %s\n' "$s" "$(field "$s" SCHEDULER)" "$st"
+  done
+  exit 0
+fi
+
+# `q` and `jobs` without SITE: run once per scheduler site, in parallel, then print each site's output.
+if [ -z "${SITE:-}" ] && [[ "$1" =~ ^(q|jobs)$ ]]; then
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  for s in $(all_sites); do
+    [[ "$(field "$s" SCHEDULER)" =~ ^(slurm|pbs)$ ]] || continue
+    SITE=$s "$0" "$@" > "$tmp/$s" 2>&1 &
+    echo $! > "$tmp/$s.pid"
+  done
+  ran=0; failed=0
+  for s in $(all_sites); do
+    [ -f "$tmp/$s.pid" ] || continue
+    ran=$((ran + 1)); rc=0
+    wait "$(cat "$tmp/$s.pid")" || rc=$?
+    [ "$rc" -eq 0 ] || failed=$((failed + 1))
+    echo "=== $s"; cat "$tmp/$s"
+  done
+  if [ "$ran" -eq 0 ]; then
+    echo "hpc: no slurm or pbs site in $SITES_CONF" >&2; exit 1
+  fi
+  if [ "$failed" -eq "$ran" ]; then
+    echo "hpc: every site failed" >&2; exit 1
+  fi
+  exit 0
+fi
+
+LOCAL="$(cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && pwd -P)"
+PROJECT="$(basename "$LOCAL")"
+
+SITE="${SITE:-${HPC_DEFAULT_SITE:-$(all_sites | head -1)}}"
+HOST=""
+if [[ "$SITE" =~ ^[A-Za-z0-9_]+$ ]]; then HOST="$(field "$SITE" HOST)"; fi
+if [ -z "$HOST" ]; then
+  echo "hpc: unknown SITE='$SITE' (known: $(all_sites | paste -sd, -))" >&2
+  exit 2
+fi
+BASE="$(field "$SITE" BASE)"
+case "$BASE" in
+  /*) ;;
+  *) echo "hpc: site_${SITE}_BASE='$BASE' must be an absolute remote path" >&2; exit 2 ;;
+esac
+case "$BASE/" in
+  "$HOME"/*)
+    # A warning, not an error: the local and remote home paths can be the same.
+    echo "hpc: warning: site_${SITE}_BASE='$BASE' starts with your local home directory." >&2
+    echo "     If you wrote ~ or \$HOME in sites.conf, write the remote path in full." >&2 ;;
+esac
+SCHEDULER="$(field "$SITE" SCHEDULER)"
+AUTH_CHECK="$(field "$SITE" AUTH_CHECK)"
+AUTH_HINT="$(field "$SITE" AUTH_HINT)"
+# Optional: shell lines that the remote command runs first, e.g. 'module load python'.
+REMOTE_ENV="$(field "$SITE" ENV)"
+REMOTE="$BASE/$PROJECT"
+# rsync hands the remote path to a remote shell, so only plain path characters are safe.
+[[ "$REMOTE" =~ ^[A-Za-z0-9._/+-]+$ ]] || {
+  echo "hpc: the remote path '$REMOTE' has characters that rsync cannot pass safely." >&2
+  echo "     Use only letters, digits and . _ / + - in the project folder name and in site_${SITE}_BASE." >&2
+  exit 2; }
+RSYNC_SSH="ssh -o BatchMode=yes"
+
+check_auth() {
+  eval "$AUTH_CHECK" >/dev/null 2>&1 || {
+    echo "hpc: not connected to $SITE: $AUTH_HINT" >&2; exit 1; }
+}
+
+# A project override: the value from the project's .envrc, else the shell's value, else the default.
+# hpc reads only this one variable through direnv, so an .envrc cannot change HOST or REMOTE.
+override() {  # override NAME DEFAULT
+  local v=""
+  if [ -f "$LOCAL/.envrc" ] && command -v direnv >/dev/null 2>&1; then
+    # Unset direnv's own state first, so that direnv loads the .envrc from scratch.
+    v=$(env -u DIRENV_DIR -u DIRENV_FILE -u DIRENV_DIFF -u DIRENV_WATCHES \
+      direnv exec "$LOCAL" printenv "$1" 2>/dev/null) || v=""
+  fi
+  [ -n "$v" ] || v="${!1:-}"
+  echo "${v:-$2}"
+}
+
+# Prints each argument quoted for bash, separated by spaces.
+quoted() { [ $# -eq 0 ] || { printf '%q' "$1"; shift; [ $# -eq 0 ] || printf ' %q' "$@"; }; }
+
+# on_site [--cd] [ARG...] < SCRIPT: run SCRIPT with bash on the site, with ARGs as $1, $2, ...
+# The script travels on stdin, so no value passes unquoted through the remote login shell.
+# The braces make bash read the whole script before it runs a command.
+on_site() {
+  local cd=""
+  if [ "${1:-}" = --cd ]; then cd=1; shift; fi
+  {
+    echo '{'
+    echo 'export PATH="$HOME/.local/bin:$PATH"'
+    [ -z "$REMOTE_ENV" ] || printf '%s\n' "$REMOTE_ENV"
+    [ -z "$cd" ] || printf 'mkdir -p %q && cd %q || exit 1\n' "$REMOTE" "$REMOTE"
+    [ $# -eq 0 ] || printf 'set -- %s\n' "$(quoted "$@")"
+    cat
+    printf '\n}\n'
+  } | ssh -o BatchMode=yes "$HOST" bash -l -s
+}
+
+check_auth
+cmd="$1"; shift
+
+case "$cmd" in
+  push)
+    [ $# -ge 1 ] || { echo "usage: hpc push PATH..." >&2; exit 2; }
+    rel=()
+    for p in "$@"; do
+      if [ -d "$p" ]; then abs=$(cd "$p" && pwd -P)
+      elif [ -e "$p" ]; then abs="$(cd "$(dirname "$p")" && pwd -P)/$(basename "$p")"
+      else echo "hpc: no such file: $p" >&2; exit 2
+      fi
+      case "$abs" in
+        "$LOCAL") rel+=(.) ;;
+        "$LOCAL"/*) rel+=("${abs#"$LOCAL"/}") ;;
+        *) echo "hpc: $p is outside the project $LOCAL" >&2; exit 2 ;;
+      esac
+    done
+    (cd "$LOCAL" && rsync -az -e "$RSYNC_SSH" --relative --exclude=.git --exclude=.venv --exclude=node_modules --exclude=__pycache__ -- "${rel[@]/#/./}" "$HOST:$REMOTE/")
+    echo "hpc: pushed $# path(s) to $SITE:$REMOTE"
+    ;;
+  down)
+    status=0; pulled=""
+    # shellcheck disable=SC2207  # HPC_PULL_DIRS is a space-separated list.
+    dirs=(results/ $(override HPC_PULL_DIRS ""))
+    for d in "${dirs[@]}"; do
+      d="${d%/}/"
+      # The probe exits 1 when the remote directory is missing. Any other failure is real.
+      rc=0; on_site "$REMOTE/$d" <<<'test -d "$1" || exit 1' || rc=$?
+      if [ "$rc" -eq 1 ]; then
+        echo "hpc: $SITE:$REMOTE/$d does not exist; skipped" >&2
+        continue
+      elif [ "$rc" -ne 0 ]; then
+        echo "hpc: could not reach $SITE to pull $d" >&2; status=1
+        continue
+      fi
+      mkdir -p "$LOCAL/$d"
+      if rsync -az -e "$RSYNC_SSH" "$HOST:$REMOTE/$d" "$LOCAL/$d"; then pulled="$pulled $d"
+      else echo "hpc: could not pull $d from $SITE" >&2; status=1
+      fi
+    done
+    [ -z "$pulled" ] || echo "hpc: pulled$pulled from $SITE"
+    exit "$status"
+    ;;
+  sync) on_site --cd "$@" <<<"$(override HPC_SYNC_CMD "uv sync") \"\$@\"" ;;
+  sh)
+    case $# in
+      0) on_site --cd <<<'pwd' ;;
+      1) on_site --cd <<<"$1" ;;
+      *) on_site --cd "$@" <<<'"$@"' ;;
+    esac
+    ;;
+  q|sbatch|log|jobs)
+    if [ "$SCHEDULER" = none ]; then
+      echo "hpc: $SITE has no scheduler. Background a run with:" >&2
+      echo "  hpc sh 'mkdir -p logs && nohup CMD > logs/x.log 2>&1 & disown'" >&2
+      echo "  hpc sh tail -n 50 logs/x.log" >&2
+      exit 2
+    fi
+    # PBS. A job's logs are readable while it runs only if the script sets `#PBS -k doe`;
+    # otherwise PBS copies them when the job ends.
+    if [ "$SCHEDULER" = pbs ]; then
+      case "$cmd" in
+        q)      on_site <<<'qstat -wu "$USER"' ;;
+        sbatch) on_site --cd "$@" <<<'qsub "$@"' ;;
+        log|jobs)
+          [ "$cmd" = jobs ] || [ $# -ge 1 ] || { echo "usage: hpc log JOBID [N]" >&2; exit 2; }
+          on_site "$cmd" "${1:-}" "${2:-}" <<'EOF'
+mode=$1
+tailjob() {  # tailjob JOBID N
+  # -F dsv prints each job on one line, so a long path does not wrap.
+  info=$(qstat -xf -F dsv "$1" 2>/dev/null) || { echo "hpc: no job $1" >&2; return 1; }
+  for key in Output_Path Error_Path; do
+    f=$(tr '|' '\n' <<<"$info" | sed -n "s/^$key=[^:]*://p")
+    [ -n "$f" ] || continue
+    if [ -r "$f" ]; then echo "== $f"; tail -c 200000 "$f" | tr '\r' '\n' | tail -n "$2"
+    else echo "== $f (not there yet; set '#PBS -k doe' for live logs)"; fi
+  done
+}
+if [ "$mode" = log ]; then tailjob "$2" "${3:-40}"; exit; fi
+qstat -wu "$USER"
+for j in $(qselect -u "$USER" -s R); do echo "--- $j"; tailjob "$j" "${2:-3}" | sed 's/^/    /'; done
+true
+EOF
+          ;;
+      esac
+      exit
+    fi
+    case "$cmd" in
+      q)      on_site <<<"squeue -u \"\$USER\" -o '%.10i %.12j %.14P %.8T %.10M %.6D %R'" ;;
+      sbatch) on_site --cd "$@" <<<'mkdir -p logs && sbatch "$@"' ;;
+      log)
+        [ $# -ge 1 ] || { echo "usage: hpc log JOBID [N]" >&2; exit 2; }
+        # Ask Slurm where the job writes: scontrol while it is live, sacct after it ends.
+        # sacct keeps the unexpanded pattern, so this expands %j %x %u %A %a.
+        on_site "$1" "${2:-40}" <<'EOF'
+j=$1; n=$2
+info=$(scontrol show job "$j" 2>/dev/null)
+if [ -n "$info" ]; then
+  out=$(sed -n 's/^ *StdOut=//p' <<<"$info"); err=$(sed -n 's/^ *StdErr=//p' <<<"$info")
+else
+  IFS='|' read -r name user out err wd <<<"$(sacct -j "$j" -X -n -P -o JobName,User,StdOut,StdErr,WorkDir | head -1)"
+  [ -n "$name" ] || { echo "hpc: no job $j in scontrol or sacct" >&2; exit 1; }
+  base=${j%%_*}; task=; [[ $j == *_* ]] && task=${j#*_}
+  expand() { local p=$1; [ -z "$p" ] && return
+    p=${p//%j/$base}; p=${p//%A/$base}; p=${p//%a/$task}; p=${p//%x/$name}; p=${p//%u/$user}
+    [[ $p == /* ]] || p="$wd/$p"; echo "$p"; }
+  out=$(expand "$out"); err=$(expand "$err")
+fi
+[ -n "$out" ] || { echo "hpc: job $j has no batch log (interactive allocation?)" >&2; exit 1; }
+for f in "$out" "$err"; do
+  [ -n "$f" ] || continue
+  if [ -r "$f" ]; then echo "== $f"; tail -c 200000 "$f" | tr '\r' '\n' | tail -n "$n"
+  else echo "== $f (not there yet)"; fi
+  [ "$err" = "$out" ] && break
+done
+EOF
+        ;;
+      jobs)
+        on_site "${1:-3}" "${HPC_FAIL_HOURS:-6}" <<'EOF'
+n=$1; h=$2
+squeue -u "$USER" -o '%.10i %.10P %.28j %.8T %.10M %.10l %.5D %R'
+for j in $(squeue -u "$USER" -h -t R -o %i); do
+  info=$(scontrol show job "$j" 2>/dev/null)
+  name=$(sed -n 's/^JobId=[0-9_]* JobName=//p' <<<"$info")
+  out=$(sed -n 's/^ *StdOut=//p' <<<"$info")
+  if [ -z "$out" ]; then echo "--- $j $name: no batch log (interactive allocation)"; continue; fi
+  echo "--- $j $name: $out"
+  [ -r "$out" ] || { echo "    (log not there yet)"; continue; }
+  # Drop blank lines, and split progress-bar carriage returns.
+  tail -c 50000 "$out" | tr '\r' '\n' | grep -av '^[[:space:]]*$' \
+    | tail -n "$n" | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/^/    /' | cut -c1-204
+done
+failed=$(sacct -u "$USER" -S "now-${h}hours" -X -n -s F,TO,OOM,NF,BF,DL \
+  -o JobID,JobName%28,State%14,Elapsed,End 2>/dev/null)
+[ -n "$failed" ] && { echo "--- failed in the last ${h} h:"; echo "$failed"; }
+true
+EOF
+        ;;
+    esac
+    ;;
+esac

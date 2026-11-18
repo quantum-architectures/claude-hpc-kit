@@ -1,0 +1,6 @@
+{
+  "name": "hpc",
+  "version": "0.1.0",
+  "description": "Skills and a small CLI that let Claude copy code to your clusters, submit Slurm or PBS jobs, watch them and pull results back",
+  "license": "MIT"
+}

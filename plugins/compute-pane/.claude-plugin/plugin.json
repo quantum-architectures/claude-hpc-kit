@@ -1,0 +1,7 @@
+{
+  "name": "compute-pane",
+  "version": "0.1.0",
+  "description": "A read-only pane that lists your Slurm and PBS jobs on the sites in the hpc site registry",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

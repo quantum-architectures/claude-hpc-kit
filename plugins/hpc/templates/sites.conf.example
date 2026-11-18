@@ -1,0 +1,49 @@
+# ~/.config/hpc/sites.conf: the compute sites that `hpc` knows.
+#
+# One block per site. Add a site by adding a block; hpc needs no change.
+# hpc sources this file as bash, so keep it to plain assignments.
+#
+# Fields:
+#   HOST        the ssh alias in ~/.ssh/config (see ssh_config.example)
+#   BASE        the remote directory that holds every project, as an absolute path.
+#               The remote project is BASE/<project name>. Do not use ~ or $HOME:
+#               hpc sources this file on your computer, so they expand to your
+#               local home directory. hpc warns about a BASE inside your local home.
+#   SCHEDULER   slurm | pbs | none
+#   AUTH_CHECK  a shell command that exits nonzero when the site is not connected
+#   AUTH_HINT   what hpc tells you when the site is not connected
+#   ENV         optional: shell lines that run before each remote command
+#
+# Optional fields that only the compute-pane plugin reads. hpc ignores them.
+# The pane reads this file as plain assignments and does not run it. Keep each
+# value on one line, and do not build a value from other variables.
+#   BUDGET         a remote shell command. The pane shows the first line of its
+#                  output in the site header, for example the hours left.
+#   GPUS_PER_NODE  the GPUs of one node, for a PBS site that gives whole nodes.
+#                  The pane counts a PBS job's GPUs as its nodes times this number.
+#                  Without it, the pane shows the job's CPUs.
+#   CONNECT        the local command that opens the connection again. The pane
+#                  shows it when the site is not connected. Without it, the pane
+#                  shows AUTH_HINT.
+#
+# Never put passwords, one-time-code seeds or tokens in this file.
+
+# A Slurm cluster that needs a password and a second factor.
+# Open the connection once a day yourself: `ssh -fN mycluster`.
+site_mycluster_HOST=mycluster
+site_mycluster_BASE=/path/to/your/project/storage
+site_mycluster_SCHEDULER=slurm
+site_mycluster_AUTH_CHECK='ssh -O check mycluster'
+site_mycluster_AUTH_HINT="run 'ssh -fN mycluster' in a terminal and log in"
+site_mycluster_ENV='module load python'
+# Optional, for the compute-pane plugin:
+# site_mycluster_BUDGET='sshare -U -n -P -o FairShare'
+# site_mycluster_CONNECT='ssh -fN mycluster'
+# site_mycluster_GPUS_PER_NODE=2    (PBS sites only)
+
+# A cloud GPU machine with key login and no scheduler.
+site_gpubox_HOST=gpubox
+site_gpubox_BASE=/home/ubuntu/work
+site_gpubox_SCHEDULER=none
+site_gpubox_AUTH_CHECK='ssh -o BatchMode=yes -o ConnectTimeout=5 gpubox true'
+site_gpubox_AUTH_HINT="start the machine and check its IP in ~/.ssh/config"
